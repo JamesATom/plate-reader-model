@@ -1,0 +1,17 @@
+# Small CCT (conv "tokenizer" + transformer), similar size to cct-xs
+model: cct
+rescaling: {scale: 0.00392156862745098, offset: 0.0}
+tokenizer:
+  blocks:
+    - {layer: Conv2D, filters: 32, kernel_size: 3, strides: 1}
+    - {layer: MaxPooling2D, pool_size: 2}
+    - {layer: Conv2D, filters: 64, kernel_size: 3, strides: 1}
+    - {layer: MaxPooling2D, pool_size: 2}
+    - {layer: Conv2D, filters: 96, kernel_size: 3, strides: 1}
+    - {layer: MaxPooling2D, pool_size: 2}
+  positional_emb: true
+transformer_encoder:
+  layers: 3
+  heads: 2
+  projection_dim: 96
+  units: [96, 96]
