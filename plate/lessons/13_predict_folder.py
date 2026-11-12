@@ -27,15 +27,18 @@ LOW = 0.01      # keep almost everything; the scoring script can filter by confi
 
 if kind == "rfdetr":
     from rfdetr import RFDETRNano
-    model = RFDETRNano(pretrain_weights=str(run_dir / "checkpoint_best_total.pth"))
+    # a training run folder, or the shared model file plate/models/plate_detector_rfdetr_nano.pth
+    weights = run_dir if run_dir.is_file() else run_dir / "checkpoint_best_total.pth"
+    model = RFDETRNano(pretrain_weights=str(weights))
 
     def detect(photo):
         found = model.predict(photo, threshold=LOW)
         return torch.tensor(found.xyxy, dtype=torch.float32).reshape(-1, 4), torch.tensor(found.confidence, dtype=torch.float32)
 else:
     from transformers import AutoImageProcessor, DFineForObjectDetection
-    processor = AutoImageProcessor.from_pretrained(run_dir / "best")
-    model = DFineForObjectDetection.from_pretrained(run_dir / "best").to(device).eval()
+    weights = run_dir / "best" if (run_dir / "best").is_dir() else run_dir  # run folder or plate/models/plate_detector_dfine_nano
+    processor = AutoImageProcessor.from_pretrained(weights)
+    model = DFineForObjectDetection.from_pretrained(weights).to(device).eval()
 
     def detect(photo):
         with torch.no_grad():

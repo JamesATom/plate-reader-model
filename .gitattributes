@@ -1,0 +1,5 @@
+plate/models/**/*.keras filter=lfs diff=lfs merge=lfs -text
+plate/models/**/*.safetensors filter=lfs diff=lfs merge=lfs -text
+plate/models/*.pth filter=lfs diff=lfs merge=lfs -text
+plate/models/*.keras filter=lfs diff=lfs merge=lfs -text
+plate/models/**/*.pth filter=lfs diff=lfs merge=lfs -text

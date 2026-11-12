@@ -15,3 +15,6 @@ wheels/
 */runs/
 */models/
 *.log
+
+# Exception: our own trained plate models are shared (stored with Git LFS, see .gitattributes)
+!plate/models/
