@@ -17,7 +17,9 @@ Two ways to decide:
   per pass   all frames of one person walking past one camera are averaged first
              (this is what a real system does: it follows the person, then decides once)
 
-Run:  uv run python face/lessons/05_chokepoint_test.py
+Run:  uv run python face/lessons/05_chokepoint_test.py P1E_S1     (indoor)
+      uv run python face/lessons/05_chokepoint_test.py P2E_S1     (outdoor, another day)
+      add --rebuild to recompute the embeddings
 """
 
 import importlib
@@ -36,10 +38,13 @@ lesson02 = importlib.import_module("02_align_faces")
 lesson04 = importlib.import_module("04_compare_models")  # MODELS: name -> embed(aligned face)
 
 ROOT = Path("face/data/chokepoint")
-SEQUENCE = "P1E_S1"
-CAMERAS = ["C1", "C2", "C3"]
 UNKNOWN_IDS = {"0023", "0024", "0025", "0026", "0027"}  # walk past the camera, but are NOT enrolled
-CACHE = Path("face/output/face_05_embeddings.npz")
+
+# Sequence from the command line, e.g. P1E_S1 (indoor) or P2E_S1 (outdoor, other day).
+SEQUENCE = next((a for a in sys.argv[1:] if not a.startswith("--")), "P1E_S1")
+# one entry per labelled camera recording: P1E_S1_C1, or P2E_S1_C1.1 / P2E_S1_C1.2 (two recording days)
+CAMERAS = sorted(p.stem.removeprefix(SEQUENCE + "_") for p in (ROOT / "groundtruth").glob(f"{SEQUENCE}_C*.xml"))
+CACHE = Path(f"face/output/face_05_embeddings_{SEQUENCE}.npz")
 
 
 def read_groundtruth(xml_path):
@@ -85,8 +90,8 @@ def build_embeddings():
             gallery[m].append(lesson04.MODELS[m](face))
     print(f"enrolled {len(gallery_ids)} people (1 photo each); {len(UNKNOWN_IDS)} people kept out as 'unknown'")
 
-    # 2. video frames
-    probe_meta, probe, eye_dists, missed = [], {m: [] for m in names}, [], defaultdict(int)
+    # 2. video frames: detect + align every labelled face, embed them all at the end in batches
+    probe_meta, aligned, eye_dists, missed = [], [], [], defaultdict(int)
     t0 = time.perf_counter()
     for cam in CAMERAS:
         labels = read_groundtruth(ROOT / "groundtruth" / f"{SEQUENCE}_{cam}.xml")
@@ -95,39 +100,50 @@ def build_embeddings():
             by_frame[row[0]].append(row)
         for frame_no, rows in by_frame.items():
             img = cv2.imread(str(ROOT / f"{SEQUENCE}_{cam}" / f"{frame_no}.jpg"))
+            if img is None:
+                missed[cam] += len(rows)
+                continue
             faces = lesson02.find_faces(img)
             for _, pid, cx, cy, eye_dist in rows:
                 points = matching_face(faces, cx, cy, eye_dist)
                 if points is None:
                     missed[cam] += 1
                     continue
-                face = lesson02.align(img, points)
+                aligned.append(lesson02.align(img, points))
                 probe_meta.append((cam, pid, frame_no))
                 eye_dists.append(eye_dist)
-                for m in names:
-                    probe[m].append(lesson04.MODELS[m](face))
         print(f"  {cam}: {len(labels)} labelled faces, detector missed {missed[cam]}   ({time.perf_counter() - t0:.0f}s)")
+    probe = {m: lesson04.embed_many(m, aligned) for m in names}
+    print(f"  embedded {len(aligned)} faces with {len(names)} models   ({time.perf_counter() - t0:.0f}s)")
 
     np.savez(CACHE, gallery_ids=np.array(gallery_ids), probe_meta=np.array(probe_meta), eye_dists=np.array(eye_dists),
              missed=np.array([missed[c] for c in CAMERAS]),
              **{f"gallery_{m}": np.array(gallery[m]) for m in names}, **{f"probe_{m}": np.array(probe[m]) for m in names})
 
 
-def evaluate():
-    d = np.load(CACHE)
+def evaluate(cache, fixed=None, quiet=False):
+    """Print the results for one sequence. Returns the best threshold per (model, mode).
+
+    fixed: thresholds chosen on ANOTHER video. Using them here is the honest test,
+    because in real life the threshold is set once, before the new video exists.
+    """
+    say = (lambda *a, **k: None) if quiet else print
+    d = np.load(cache)
     names = [k.removeprefix("gallery_") for k in d.files if k.startswith("gallery_") and k != "gallery_ids"]
     gallery_ids, meta, eye_dists = d["gallery_ids"], d["probe_meta"], d["eye_dists"]
     total = len(meta) + int(d["missed"].sum())
-    print(f"\nvideo faces: {total} labelled, {len(meta)} found by our detector "
-          f"({len(meta) / total:.0%}); eye distance median {np.median(eye_dists):.0f}px "
-          f"(a face is roughly 2.5x that wide)")
+    say(f"\nvideo faces: {total} labelled, {len(meta)} found by our detector "
+        f"({len(meta) / total:.0%}); eye distance median {np.median(eye_dists):.0f}px "
+        f"(a face is roughly 2.5x that wide)")
 
     # passes: one person, one camera
     passes = defaultdict(list)
     for i, (cam, pid, _) in enumerate(meta):
         passes[(cam, pid)].append(i)
 
-    print(f"\n{'model':<9} {'decide':<9} {'known: correct':>15} {'known score':>12} {'unknown score':>14} {'gap':>6}  {'best thr':>8}  {'errors at best thr':>18}")
+    header = f"\n{'model':<9} {'decide':<9} {'known: correct':>15} {'known score':>12} {'unknown score':>14} {'gap':>6}  {'best thr':>8}  {'errors at best thr':>18}"
+    say(header + (f"  {'errors at FIXED thr':>20}" if fixed else ""))
+    chosen = {}
     for m in names:
         G, P = d[f"gallery_{m}"], d[f"probe_{m}"]
         for mode in ["per frame", "per pass"]:
@@ -150,16 +166,26 @@ def evaluate():
                 return int((known & ~(correct & (best_score >= thr))).sum() + (~known & (best_score >= thr)).sum())
 
             thr = min(np.unique(best_score), key=errors)
+            chosen[(m, mode)] = float(thr)
             k_scores = best_score[known & correct]
-            u_scores = best_score[~known]
-            print(f"{m:<9} {mode:<9} {correct[known].mean():>14.1%} "
-                  f"{np.percentile(k_scores, 5):>12.2f} {u_scores.max():>14.2f} "
-                  f"{np.percentile(k_scores, 5) - u_scores.max():>+6.2f}  {thr:>8.2f}  {errors(thr):>8}/{len(truth)}")
-    print("\nknown score   = 5% of correct matches score lower than this")
-    print("unknown score = highest score any not-enrolled person reached (should be below the threshold)")
+            u_scores = best_score[~known] if (~known).any() else np.array([-1.0])
+            line = (f"{m:<9} {mode:<9} {correct[known].mean():>14.1%} "
+                    f"{np.percentile(k_scores, 5):>12.2f} {u_scores.max():>14.2f} "
+                    f"{np.percentile(k_scores, 5) - u_scores.max():>+6.2f}  {thr:>8.2f}  {errors(thr):>8}/{len(truth)}")
+            if fixed:
+                f_thr = fixed[(m, mode)]
+                line += f"  {errors(f_thr):>9}/{len(truth)} @ {f_thr:.2f}"
+            say(line)
+    say("\nknown score   = 5% of correct matches score lower than this")
+    say("unknown score = highest score any not-enrolled person reached (should be below the threshold)")
+    if fixed:
+        say("FIXED thr     = the best threshold from P1E_S1 (indoor video), reused here without changing it")
+    return chosen
 
 
 if __name__ == "__main__":
     if not CACHE.exists() or "--rebuild" in sys.argv:
         build_embeddings()
-    evaluate()
+    reference = Path("face/output/face_05_embeddings_P1E_S1.npz")
+    fixed = evaluate(reference, quiet=True) if SEQUENCE != "P1E_S1" and reference.exists() else None
+    evaluate(CACHE, fixed)
