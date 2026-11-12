@@ -9,12 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
-# Generated images
-output/
-
-# Datasets (too large for git)
-data/
-
-# Training results
-runs/
+# Per-model folders: generated images, datasets, training results, downloaded weights
+*/output/
+*/data/
+*/runs/
+*/models/
 *.log
