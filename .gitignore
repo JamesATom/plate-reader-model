@@ -16,5 +16,8 @@ wheels/
 */models/
 *.log
 
-# Exception: our own trained plate models are shared (stored with Git LFS, see .gitattributes)
+# Exception: our own trained models are shared (stored with Git LFS, see .gitattributes)
 !plate/models/
+!vehicle/models/
+# ...but not the downloaded third-party base model (vehicle/download_models.py fetches it)
+vehicle/models/veri_*.pth

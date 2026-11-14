@@ -7,6 +7,7 @@ One folder per model. Run every lesson from the project root, e.g.
 |---|---|---|---|
 | `plate/` | Plate reading (ANPR) | RF-DETR Nano detector + 2 fast-plate-ocr CCT readers, **trained by us** | done |
 | `face/` | Face detection and recognition | YuNet detector + AdaFace IR-101 recognizer (SFace, EdgeFace compared), **pretrained, not retrained** | working app, tested on ChokePoint video |
+| `vehicle/` | Vehicle re-identification (same car in another camera) | FastReID SBS R50-ibn (VeRi-776), **fine-tuned by us** on RoundaboutHD + Uzbek cars | models + tests done, video app next |
 
 ## Where the models are
 
@@ -16,6 +17,9 @@ One folder per model. Run every lesson from the project root, e.g.
 - **Face:** made by other teams, so not copied into the repo. Download them from their official sources:
   `uv run python face/download_models.py` (checks SHA-256). Licenses are listed in that script;
   EdgeFace weights are non-commercial only.
+- **Vehicle:** our fine-tuned models are in [`vehicle/models/`](vehicle/models/) (Git LFS); results and
+  how to reproduce: [`vehicle/models/README.md`](vehicle/models/README.md). The base model they start
+  from is downloaded: `uv run python vehicle/download_models.py`. Non-commercial (VeRi-776).
 
 ## Setup
 
@@ -23,6 +27,7 @@ One folder per model. Run every lesson from the project root, e.g.
 uv sync
 git lfs pull
 uv run python face/download_models.py
+uv run python vehicle/download_models.py
 ```
 
 ## Layout inside each model folder
@@ -30,7 +35,7 @@ uv run python face/download_models.py
 - `lessons/` numbered step-by-step scripts
 - `configs/` training configs
 - `reports/` results and what we learned
-- `models/` shared model files (plate only; face models are downloaded)
+- `models/` shared model files (plate, vehicle; face and base vehicle models are downloaded)
 - `data/`, `runs/`, `output/` datasets, training runs, outputs (not in git)
 
 The face app (enrol people, then recognise them in a video): see [`face/app/`](face/app/).
