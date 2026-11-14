@@ -59,7 +59,8 @@ EMBED_MIN_W = 60
 MIN_LEN = 5                       # tracks seen fewer times are noise
 STITCH_S, STITCH_COS = 8, 0.5     # join track pieces: at most 8 s apart and similar looking
 ROI_CELL = 64                     # road-area grid cell, pixels
-SETTINGS = {"roundabout_uzbek_finetuned.pt": (0.52, 0.4)}   # (threshold, TIME_W), picked with --tune on group A
+ZONE_CELL = 128                   # entry / exit zone grid cell, pixels
+SETTINGS = {"roundabout_uzbek_finetuned.pt": (0.31, 0.3)}   # (threshold, TIME_W), picked with --tune (2-fold cross-validation)
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 
@@ -262,6 +263,31 @@ def travel_times(group_b):
     return {k: (np.median(v), np.percentile(v, 75) - np.percentile(v, 25)) for k, v in gaps.items()}
 
 
+def foot_cell(box):
+    """grid cell under the middle of the box's bottom edge (where the car touches the road)"""
+    return int(box[3]) // ZONE_CELL, int((box[0] + box[2]) / 2) // ZONE_CELL
+
+
+def learn_zones(group_b):
+    """per camera pair (a, b): where cars LEAVE camera a and where they ENTER camera b on that trip,
+    learned from group-A cars (an operator would draw these once per camera)"""
+    exits, entries = defaultdict(set), defaultdict(set)
+    per_car = defaultdict(list)
+    for (c, i), b in lesson05.load_tracks().items():
+        if i not in group_b:
+            per_car[i].append((min(b), max(b), c, b))
+    for seq in per_car.values():
+        seq.sort(key=lambda t: t[0])
+        for (s1, e1, c1, b1), (s2, e2, c2, b2) in zip(seq, seq[1:]):
+            if abs(c1 - c2) == 1:
+                exits[(c1, c2)].add(foot_cell(b1[e1]))
+                entries[(c1, c2)].add(foot_cell(b2[s2]))
+
+    def grow(cells):
+        return {(y + dy, x + dx) for y, x in cells for dy in (-1, 0, 1) for dx in (-1, 0, 1)}
+    return {p: grow(c) for p, c in exits.items()}, {p: grow(c) for p, c in entries.items()}
+
+
 def gt_owners(keys, tracks):
     """our track -> the ground-truth car it follows (IoU >= 0.5 on at least half of its frames), or None"""
     gt = lesson05.load_tracks()
@@ -310,7 +336,7 @@ def evaluate(keys, tracks, links, gt, owner, group, quiet=False):
               f"the ground truth does not have, {len(pred) - good - to_none} to another car)")
         print(f"  real camera-to-camera trips: {len(transitions)}, found: {len(transitions & made)} -> recall {r:.1%}"
               f"   F1 {f1:.1%}")
-    return p, r, f1
+    return p, r, f1, (good, len(pred), len(transitions & made), len(transitions))
 
 
 def render(keys, tracks, gid, minutes):
@@ -350,7 +376,8 @@ def main():
     ap.add_argument("--threshold", type=float)
     ap.add_argument("--time-w", type=float)
     ap.add_argument("--video-minutes", type=float, default=3)
-    ap.add_argument("--tune", action="store_true", help="pick threshold and TIME_W on group-A cars")
+    ap.add_argument("--tune", action="store_true", help="pick threshold and TIME_W by cross-validation")
+    ap.add_argument("--no-zones", action="store_true", help="do not use entry / exit zones")
     args = ap.parse_args()
     threshold, time_w = SETTINGS.get(Path(args.model).name, (0.6, 0.0))
     threshold = args.threshold if args.threshold is not None else threshold
@@ -380,6 +407,14 @@ def main():
 
     vecs = np.stack([t["vec"] for t in tracks])
     cands = lesson05.candidates(keys, {k: t["frames"] for k, t in zip(keys, tracks)})
+    if not args.no_zones:     # a trip a -> b must leave a through its exit zone and enter b through its entry zone
+        exits, entries = learn_zones(group_b)
+        ends = [foot_cell(t["frames"][max(t["frames"])]) for t in tracks]
+        starts = [foot_cell(t["frames"][min(t["frames"])]) for t in tracks]
+        before = len(cands)
+        cands = [(a, b, g) for a, b, g in cands
+                 if ends[a] in exits.get((keys[a][0], keys[b][0]), ()) and starts[b] in entries.get((keys[a][0], keys[b][0]), ())]
+        print(f"entry / exit zones: {before} -> {len(cands)} candidate pairs")
     typical = travel_times(group_b)
 
     def unusual(a, b, g):
@@ -387,19 +422,29 @@ def main():
         med, spread = typical.get((keys[a][0], keys[b][0]), (40, 30))
         return max(0.0, abs(g - med) - spread) / 60
 
+    def scorer(w):
+        return lambda a, b, g: float(vecs[a] @ vecs[b]) - w * unusual(a, b, g)
+
     gt, owner = gt_owners(keys, tracks)
-    if args.tune:     # pick on group-A cars (seen in training), never on the exam cars
-        group_a = {o for o in owner if o is not None} - group_b
-        best = (-1, None, None)
-        for w in (0.0, 0.1, 0.2, 0.4, 0.8):
-            score = lambda a, b, g, w=w: float(vecs[a] @ vecs[b]) - w * unusual(a, b, g)   # noqa: E731
-            for t in np.arange(0.40, 0.81, 0.02):
-                f1 = evaluate(keys, tracks, lesson05.link(cands, score, t), gt, owner, group_a, quiet=True)[2]
-                if f1 > best[0]:
-                    best = (f1, round(float(t), 2), w)
-        _, threshold, time_w = best
-        print(f"picked on group A: threshold {threshold}, TIME_W {time_w} (F1 there {best[0]:.1%})")
-    links = lesson05.link(cands, lambda a, b, g: float(vecs[a] @ vecs[b]) - time_w * unusual(a, b, g), threshold)
+    if args.tune:
+        # The fine-tuned model has SEEN group-A cars: their similarities are inflated, so a threshold picked
+        # there is too strict for new cars. Honest alternative: 2-fold cross-validation inside group B:
+        # pick (threshold, TIME_W) on one half of the cars, score on the other half, then swap.
+        cars = sorted(group_b)
+        halves = [set(cars[0::2]), set(cars[1::2])]
+        total, picked = np.zeros(4), []
+        for pick, test in ((halves[0], halves[1]), (halves[1], halves[0])):
+            best = max(((evaluate(keys, tracks, lesson05.link(cands, scorer(w), t), gt, owner, pick, quiet=True)[2], t, w)
+                        for w in (0.0, 0.2, 0.4, 0.8) for t in np.arange(0.0, 0.81, 0.02)), key=lambda x: x[0])
+            picked.append(best[1:])
+            total += evaluate(keys, tracks, lesson05.link(cands, scorer(best[2]), best[1]), gt, owner, test, quiet=True)[3]
+        p, r = total[0] / total[1], total[2] / total[3]
+        print(f"cross-validated on group B: picked {[(round(float(t), 2), w) for t, w in picked]} -> "
+              f"precision {p:.1%}  recall {r:.1%}  F1 {2 * p * r / (p + r):.1%}   <- the honest score")
+        threshold = round(float(np.mean([t for t, _ in picked])), 2)
+        time_w = float(np.mean([w for _, w in picked]))
+        print(f"settings for use: threshold {threshold}, TIME_W {time_w} (mean of the two picks)")
+    links = lesson05.link(cands, scorer(time_w), threshold)
 
     # global numbers: follow the links
     nxt = dict(links)

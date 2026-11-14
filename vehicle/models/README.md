@@ -44,17 +44,22 @@ All exam cars were never used for training (split by car, not by image).
 
 ## Same car across the 4 cameras (lesson 05 and the app)
 
-Cars never used in training (group B); threshold picked on group-A cars only.
+Cars never used in training (group B). Up to "App v2" the threshold was picked on group-A cars; from
+lesson 06 on it is picked by 2-fold cross-validation inside group B (pick on half of the cars, score on the
+other half), because the model has seen group-A cars: same-car similarity there is 0.84 (median) against
+0.69 on new cars, so a group-A threshold is too strict and costs recall.
 
 | Setup | Precision | Recall | F1 |
 |---|---|---|---|
 | Ground-truth tracks, time only (no re-ID) | 7.2% | 11.1% | 8.8% |
 | Ground-truth tracks, VeRi base | 82.1% | 73.9% | 77.8% |
 | Ground-truth tracks, + RoundaboutHD | 94.2% | 74.7% | 83.3% |
-| Ground-truth tracks, + RoundaboutHD + Uzbek | **94.5%** | **78.5%** | **85.8%** |
+| Ground-truth tracks, + RoundaboutHD + Uzbek | 94.5% | 78.5% | 85.8% |
+| Ground-truth tracks, + zones + travel time + cross-validated threshold (lesson 06) | **94.7%** | **96.2%** | **95.4%** |
 | App v1: IoU tracker, + RoundaboutHD + Uzbek | 70.0% | 72.0% | 71.0% |
 | App v2: ByteTrack-style tracker + road area | 78.7% | 75.6% | 77.1% |
-| **App v2 + travel time** (current) | **83.2%** | **81.1%** | **82.1%** |
+| App v2 + travel time | 83.2% | 81.1% | 82.1% |
+| **App v3: + entry/exit zones + cross-validated threshold** (current) | **83.7%** | **92.1%** | **87.7%** |
 
 - Precision = share of the links we made that join the same car; recall = share of the real
   camera-to-camera trips we found (254 trips of 155 cars in 10 minutes).
@@ -66,7 +71,12 @@ Cars never used in training (group B); threshold picked on group-A cars only.
   Road areas, usual travel times, the 0.4 and the threshold 0.52 were all picked on group-A cars.
 - The detector finds 99% of the car passages. What is left: a car's track still breaks into ~2 pieces
   (long hides behind the island), and 40 of the 59 wrong links go to vehicles the ground truth does not label.
-- App: `uv run python vehicle/app/multicam.py` (RF-DETR Medium COCO detector, tracker, re-ID, links).
+- App v3: entry/exit zones (where cars leave camera a / enter camera b on each trip, learned from
+  group-A cars) cut the candidate pairs 11x (499k -> 45k). Recall 81% -> 92%. Of the 48 wrong links in
+  the last run, 31 go to vehicles the ground truth does not label.
+- Camera-bias removal (subtract each camera's mean vector) helps the base VeRi model only; not used.
+- App: `uv run python vehicle/app/multicam.py` (RF-DETR Medium COCO detector, tracker, re-ID, links);
+  `--tune` re-picks the threshold and travel-time weight by cross-validation.
 
 ## Data
 
