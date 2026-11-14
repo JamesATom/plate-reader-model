@@ -42,6 +42,27 @@ All exam cars were never used for training (split by car, not by image).
 - Why not the paper's 99.7% on RoundaboutHD: its train set contains all 310 test cars (neighbouring
   frames), so that number measures memory, not re-ID.
 
+## Same car across the 4 cameras (lesson 05 and the app)
+
+Cars never used in training (group B); threshold picked on group-A cars only.
+
+| Setup | Precision | Recall | F1 |
+|---|---|---|---|
+| Ground-truth tracks, time only (no re-ID) | 7.2% | 11.1% | 8.8% |
+| Ground-truth tracks, VeRi base | 82.1% | 73.9% | 77.8% |
+| Ground-truth tracks, + RoundaboutHD | 94.2% | 74.7% | 83.3% |
+| Ground-truth tracks, + RoundaboutHD + Uzbek | **94.5%** | **78.5%** | **85.8%** |
+| **App: our detector + tracker**, + RoundaboutHD + Uzbek | 70.0% | 72.0% | 71.0% |
+
+- Precision = share of the links we made that join the same car; recall = share of the real
+  camera-to-camera trips we found (254 trips of 155 cars in 10 minutes).
+- A busy roundabout: every true trip has ~135 candidate tracks in the next camera within 180 s, so travel
+  time alone cannot do it.
+- The app loses ~15 points against perfect tracks: the detector finds 99% of the car passages, but a car's
+  track breaks into ~2 pieces (lost behind signs / the island), and about half of the wrong links go to
+  vehicles outside the labelled area.
+- App: `uv run python vehicle/app/multicam.py` (detector RF-DETR Medium COCO, IoU tracker, re-ID, links).
+
 ## Data
 
 - [RoundaboutHD](https://github.com/siri-rouser/RoundaboutHD) (University of Bath, MIT licence): 4 street cameras, 4K.
