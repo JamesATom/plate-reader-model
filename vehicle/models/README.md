@@ -52,16 +52,21 @@ Cars never used in training (group B); threshold picked on group-A cars only.
 | Ground-truth tracks, VeRi base | 82.1% | 73.9% | 77.8% |
 | Ground-truth tracks, + RoundaboutHD | 94.2% | 74.7% | 83.3% |
 | Ground-truth tracks, + RoundaboutHD + Uzbek | **94.5%** | **78.5%** | **85.8%** |
-| **App: our detector + tracker**, + RoundaboutHD + Uzbek | 70.0% | 72.0% | 71.0% |
+| App v1: IoU tracker, + RoundaboutHD + Uzbek | 70.0% | 72.0% | 71.0% |
+| App v2: ByteTrack-style tracker + road area | 78.7% | 75.6% | 77.1% |
+| **App v2 + travel time** (current) | **83.2%** | **81.1%** | **82.1%** |
 
 - Precision = share of the links we made that join the same car; recall = share of the real
   camera-to-camera trips we found (254 trips of 155 cars in 10 minutes).
 - A busy roundabout: every true trip has ~135 candidate tracks in the next camera within 180 s, so travel
   time alone cannot do it.
-- The app loses ~15 points against perfect tracks: the detector finds 99% of the car passages, but a car's
-  track breaks into ~2 pieces (lost behind signs / the island), and about half of the wrong links go to
-  vehicles outside the labelled area.
-- App: `uv run python vehicle/app/multicam.py` (detector RF-DETR Medium COCO, IoU tracker, re-ID, links).
+- App v2: the tracker predicts each car's motion and lets weak boxes (half-hidden car) continue a track;
+  cars outside the road area and parked cars are ignored; the link score is
+  `cosine - 0.4 x (minutes the travel time is outside the usual range for that camera pair)`.
+  Road areas, usual travel times, the 0.4 and the threshold 0.52 were all picked on group-A cars.
+- The detector finds 99% of the car passages. What is left: a car's track still breaks into ~2 pieces
+  (long hides behind the island), and 40 of the 59 wrong links go to vehicles the ground truth does not label.
+- App: `uv run python vehicle/app/multicam.py` (RF-DETR Medium COCO detector, tracker, re-ID, links).
 
 ## Data
 

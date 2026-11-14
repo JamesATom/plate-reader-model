@@ -2,23 +2,27 @@
 
 For each camera video (synchronised):
   1. detect   RF-DETR Medium (COCO) finds cars / buses / trucks, 5 times per second
-  2. track    a box is joined to the track whose last box overlaps it most (IoU), so one car's passage
-              through one camera = one track. Tracks that do not move (parked cars) are ignored.
-  3. describe every 3rd box of a track (>= 60 px wide) -> our re-ID model -> 2048 numbers;
-              the track's fingerprint = mean of its bigger half
+              (saved once, so the next steps can be re-run in seconds)
+  2. track    "ByteTrack" idea: predict where each car moves (constant speed), match confident boxes
+              first (Hungarian, IoU), then let weak boxes (half-hidden car) continue existing tracks;
+              a lost track waits LOST_S seconds at its predicted place. Pieces of one car are stitched.
+              Ignored: parked cars (never move), cars outside the road area of the camera.
+  3. describe 8 crops per track (the bigger half of its boxes) -> our re-ID model -> mean = fingerprint
 Then across cameras (lesson 05):
-  4. link     cameras are a chain 1-2-3-4; a track can continue in the next camera 0..180 s later;
-              best cosine first, each track at most one next / one previous, cosine >= THRESHOLD
+  4. link     cameras are a chain 1-2-3-4; a track can continue in the next camera 0..180 s later.
+              score = cosine - TIME_W * (how unusual the travel time is); best first,
+              each track at most one next / one previous, score >= threshold
   5. number   linked tracks share one global number
 
-Outputs (vehicle/output/):
-  multicam_tracks.csv   global_id, camera, start_s, end_s, frames, linked_to
-  multicam.mp4          the 4 cameras in a 2x2 grid, boxes with global numbers (first --video-minutes)
-  + a score against the RoundaboutHD ground truth (cars never used in training, group B)
+Honest tuning: the road areas, typical travel times, TIME_W and the threshold all come from group-A cars
+(seen in training); the score is on group-B cars only (never used anywhere).
 
-Run:  uv run python vehicle/app/multicam.py                     (all 10 minutes, ~25 min on an M4)
-      uv run python vehicle/app/multicam.py --minutes 2         (quick test)
-      uv run python vehicle/app/multicam.py --model vehicle/models/roundabout_finetuned.pt
+Outputs (vehicle/output/):
+  multicam_tracks.csv   global_id, camera, start_s, end_s, frames, next camera
+  multicam.mp4          the 4 cameras in a 2x2 grid, boxes with global numbers (first --video-minutes)
+
+Run:  uv run python vehicle/app/multicam.py                     (first run ~25 min on an M4: detection)
+      uv run python vehicle/app/multicam.py --tune              (re-pick TIME_W and threshold on group A)
 """
 
 import argparse
@@ -38,6 +42,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+from scipy.optimize import linear_sum_assignment
 
 sys.path.insert(0, "vehicle/lessons")
 from fastreid_net import load_vehicle_reid  # noqa: E402
@@ -48,12 +53,13 @@ DATA = Path("vehicle/data/RoundaboutHD")
 OUT = Path("vehicle/output")
 FPS, STEP = 15, 3                 # video is 15 fps, we look at every 3rd frame = 5 per second
 VEHICLES = {3, 6, 8}              # COCO ids: car, bus, truck
-DET_CONF, MIN_W = 0.4, 40
-MATCH_IOU, MAX_MISSING = 0.1, 10  # tracking: min overlap; a track may miss 10 looks (2 s) before it ends
-EMBED_EVERY, EMBED_MIN_W = 3, 60
+LOW_CONF, HIGH_CONF, MIN_W = 0.15, 0.4, 40
+IOU_HIGH, IOU_LOW, LOST_S = 0.2, 0.3, 5
+EMBED_MIN_W = 60
 MIN_LEN = 5                       # tracks seen fewer times are noise
 STITCH_S, STITCH_COS = 8, 0.5     # join track pieces: at most 8 s apart and similar looking
-THRESHOLD = {"roundabout_uzbek_finetuned.pt": 0.58}  # picked on group-A cars with --tune (never on the exam cars)
+ROI_CELL = 64                     # road-area grid cell, pixels
+SETTINGS = {"roundabout_uzbek_finetuned.pt": (0.52, 0.4)}   # (threshold, TIME_W), picked with --tune on group A
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 
@@ -62,76 +68,136 @@ def iou(a, b):
     return inter / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter + 1e-9)
 
 
-def track_camera(cam, detector, net, last_frame):
-    """-> list of tracks {frames: {frame: box}, vecs: [(area, vector)]}"""
+def detect_camera(cam, detector, last_frame):
+    """-> {frame: [(x1, y1, x2, y2, conf), ...]} vehicles only, also weak ones (>= LOW_CONF)"""
+    cache = OUT / f"multicam_det_cam{cam}.json"
+    if cache.exists():
+        d = json.load(open(cache))
+        if d["last_frame"] >= last_frame:
+            return {int(f): v for f, v in d["frames"].items() if int(f) < last_frame}
     cap = cv2.VideoCapture(str(DATA / f"imagesc{cam:03d}" / "video.mp4"))
-    active, done = [], []
-    t0 = time.perf_counter()
+    out, t0 = {}, time.perf_counter()
     for f in range(0, last_frame, STEP):
         for _ in range(STEP - 1 if f else 0):
             cap.grab()
         ok, frame = cap.read()
         if not ok:
             break
-        det = detector.predict(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), threshold=DET_CONF)
-        boxes = [tuple(map(float, b)) for b, c in zip(det.xyxy, det.class_id)
-                 if int(c) in VEHICLES and b[2] - b[0] >= MIN_W]
-
-        # match boxes to active tracks: best overlap first
-        pairs = sorted(((iou(t["last"], b), ti, bi) for ti, t in enumerate(active) for bi, b in enumerate(boxes)),
-                       reverse=True)
-        used_t, used_b = set(), set()
-        for v, ti, bi in pairs:
-            if v < MATCH_IOU:
-                break
-            if ti not in used_t and bi not in used_b:
-                used_t.add(ti)
-                used_b.add(bi)
-                active[ti]["frames"][f] = boxes[bi]
-                active[ti]["last"], active[ti]["missing"] = boxes[bi], 0
-        for bi, b in enumerate(boxes):
-            if bi not in used_b:
-                active.append({"frames": {f: b}, "last": b, "missing": 0, "vecs": []})
-        for ti, t in enumerate(active):
-            if ti not in used_t and f not in t["frames"]:
-                t["missing"] += 1
-
-        # describe: every EMBED_EVERY-th box of each track
-        crops, owners = [], []
-        for t in active:
-            if t["missing"] == 0 and (len(t["frames"]) - 1) % EMBED_EVERY == 0:
-                x1, y1, x2, y2 = (int(v) for v in t["last"])
-                if x2 - x1 >= EMBED_MIN_W:
-                    crops.append(cv2.resize(cv2.cvtColor(frame[max(0, y1):y2, max(0, x1):x2], cv2.COLOR_BGR2RGB), (256, 256)))
-                    owners.append(t)
-        if crops:
-            x = torch.from_numpy(np.stack(crops).astype(np.float32)).permute(0, 3, 1, 2).to(DEVICE)
-            v = net(x).cpu().numpy()
-            for t, row, c in zip(owners, v / np.linalg.norm(v, axis=1, keepdims=True), crops):
-                t["vecs"].append(((t["last"][2] - t["last"][0]) * (t["last"][3] - t["last"][1]), row.astype(np.float16)))
-
-        done += [t for t in active if t["missing"] > MAX_MISSING]
-        active = [t for t in active if t["missing"] <= MAX_MISSING]
+        det = detector.predict(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), threshold=LOW_CONF)
+        out[f] = [[*map(float, b), float(c)] for b, k, c in zip(det.xyxy, det.class_id, det.confidence)
+                  if int(k) in VEHICLES and b[2] - b[0] >= MIN_W]
         if f % (FPS * 60) == 0:
-            print(f"  camera {cam}: {f / FPS / 60:.0f}/{last_frame / FPS / 60:.0f} min, "
-                  f"{len(done) + len(active)} tracks ({(time.perf_counter() - t0) / 60:.1f} min)", flush=True)
-    return done + active
+            print(f"  camera {cam}: detecting {f / FPS / 60:.0f}/{last_frame / FPS / 60:.0f} min "
+                  f"({(time.perf_counter() - t0) / 60:.1f} min)", flush=True)
+    json.dump({"last_frame": last_frame, "frames": out}, open(cache, "w"))
+    return out
 
 
-def finish(tracks):
-    """keep moving, long-enough tracks that have a fingerprint; fingerprint = mean of the bigger half"""
-    kept = []
-    for t in tracks:
-        if len(t["frames"]) < MIN_LEN or not t["vecs"]:
+def track(dets):
+    """ByteTrack-style tracking -> [{frames: {frame: box}}]"""
+    active, done, max_lost = [], [], LOST_S * FPS // STEP
+
+    def predicted(t):
+        return t["last"] + t["vel"] * (t["lost"] + 1)
+
+    def match(tracks, boxes, min_iou):
+        if not tracks or not boxes:
+            return [], list(range(len(tracks))), list(range(len(boxes)))
+        cost = np.array([[1 - iou(predicted(t), b) for b in boxes] for t in tracks])
+        rows, cols = linear_sum_assignment(cost)
+        pairs = [(r, c) for r, c in zip(rows, cols) if 1 - cost[r, c] >= min_iou]
+        mt, mb = {r for r, _ in pairs}, {c for _, c in pairs}
+        return pairs, [i for i in range(len(tracks)) if i not in mt], [j for j in range(len(boxes)) if j not in mb]
+
+    def update(t, box, f):
+        box = np.array(box[:4])
+        t["vel"] = 0.5 * t["vel"] + 0.5 * (box - t["last"]) / (t["lost"] + 1)   # smoothed speed per look
+        t["last"], t["lost"] = box, 0
+        t["frames"][f] = box.tolist()
+
+    for f in sorted(dets):
+        high = [d for d in dets[f] if d[4] >= HIGH_CONF]
+        low = [d for d in dets[f] if d[4] < HIGH_CONF]
+        pairs, rest, new = match(active, high, IOU_HIGH)            # 1. confident boxes, all tracks
+        for r, c in pairs:
+            update(active[r], high[c], f)
+        recent = [active[i] for i in rest if active[i]["lost"] == 0]
+        pairs2, _, _ = match(recent, low, IOU_LOW)                  # 2. weak boxes continue recent tracks
+        for r, c in pairs2:
+            update(recent[r], low[c], f)
+        for t in active:
+            if f not in t["frames"]:
+                t["lost"] += 1
+        for c in new:                                               # 3. new tracks from confident boxes only
+            active.append({"frames": {f: high[c][:4]}, "last": np.array(high[c][:4]), "vel": np.zeros(4), "lost": 0})
+        done += [t for t in active if t["lost"] > max_lost]
+        active = [t for t in active if t["lost"] <= max_lost]
+    return [{"frames": t["frames"]} for t in done + active]
+
+
+def road_masks(group_b):
+    """per camera: grid cells where group-A cars drive (stands in for an area an operator would draw once)"""
+    masks = {}
+    for (c, i), boxes in lesson05.load_tracks().items():
+        if i in group_b:
             continue
-        b = list(t["frames"].values())
-        centres = np.array([((x1 + x2) / 2, (y1 + y2) / 2) for x1, y1, x2, y2 in b])
-        width = np.median([x2 - x1 for x1, _, x2, _ in b])
-        if np.linalg.norm(centres.max(0) - centres.min(0)) < 0.5 * width:
-            continue                                            # parked: never moved half its width
-        areas = np.array([a for a, _ in t["vecs"]])
-        v = np.mean([vec.astype(np.float32) for a, vec in t["vecs"] if a >= np.median(areas)], axis=0)
-        kept.append({"frames": t["frames"], "vec": v / np.linalg.norm(v)})
+        m = masks.setdefault(c, np.zeros((2160 // ROI_CELL + 1, 3840 // ROI_CELL + 1), np.uint8))
+        for x1, y1, x2, y2 in boxes.values():
+            m[min(int(y2) // ROI_CELL, m.shape[0] - 1), min(int((x1 + x2) / 2) // ROI_CELL, m.shape[1] - 1)] = 1
+    return {c: cv2.dilate(m, np.ones((5, 5), np.uint8)) for c, m in masks.items()}
+
+
+def keep(t, mask):
+    """long enough, moving, and mostly on the road area"""
+    b = list(t["frames"].values())
+    if len(b) < MIN_LEN:
+        return False
+    centres = np.array([((x1 + x2) / 2, (y1 + y2) / 2) for x1, y1, x2, y2 in b])
+    if np.linalg.norm(centres.max(0) - centres.min(0)) < 0.5 * np.median([x2 - x1 for x1, _, x2, _ in b]):
+        return False                                            # parked: never moved half its width
+    on_road = [mask[min(int(y2) // ROI_CELL, mask.shape[0] - 1), min(int((x1 + x2) / 2) // ROI_CELL, mask.shape[1] - 1)]
+               for x1, _, x2, y2 in b]
+    return np.mean(on_road) >= 0.5
+
+
+def embed(cam, tracks, net):
+    """8 crops per track (bigger half of its boxes, >= EMBED_MIN_W wide) -> mean re-ID vector"""
+    wanted = defaultdict(list)
+    for k, t in enumerate(tracks):
+        wide = {f: b for f, b in t["frames"].items() if b[2] - b[0] >= EMBED_MIN_W}
+        for f in lesson05.pick_frames(wide) if wide else []:
+            wanted[f].append((k, wide[f]))
+    sums = np.zeros((len(tracks), 2048), np.float32)
+    cap = cv2.VideoCapture(str(DATA / f"imagesc{cam:03d}" / "video.mp4"))
+    batch, owners = [], []
+
+    def flush():
+        x = torch.from_numpy(np.stack(batch).astype(np.float32)).permute(0, 3, 1, 2).to(DEVICE)
+        v = net(x).cpu().numpy()
+        for k, row in zip(owners, v / np.linalg.norm(v, axis=1, keepdims=True)):
+            sums[k] += row
+        batch.clear()
+        owners.clear()
+
+    for f in range(max(wanted) + 1 if wanted else 0):
+        if f not in wanted:
+            cap.grab()
+            continue
+        ok, frame = cap.read()
+        if not ok:
+            break
+        for k, (x1, y1, x2, y2) in wanted[f]:
+            batch.append(cv2.resize(cv2.cvtColor(frame[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)],
+                                                 cv2.COLOR_BGR2RGB), (256, 256)))
+            owners.append(k)
+        if len(batch) >= 64:
+            flush()
+    if batch:
+        flush()
+    kept = []
+    for k, t in enumerate(tracks):
+        if sums[k].any():
+            kept.append({"frames": t["frames"], "vec": sums[k] / np.linalg.norm(sums[k])})
     return kept
 
 
@@ -174,6 +240,28 @@ def stitch(tracks):
     return out
 
 
+def exam_cars():
+    """group B as ground-truth ids: the cars never used in any training (lesson 02 split)"""
+    mapping = lesson05.reid_to_gt()
+    _, group_b_reid = lesson05.lesson02.split_cars()
+    return {mapping[c] for c in group_b_reid if c in mapping}
+
+
+def travel_times(group_b):
+    """typical seconds from leaving camera a to entering camera b, from group-A cars: (median, spread)"""
+    gaps = defaultdict(list)
+    per_car = defaultdict(list)
+    for (c, i), b in lesson05.load_tracks().items():
+        if i not in group_b:
+            per_car[i].append((min(b), max(b), c))
+    for seq in per_car.values():
+        seq.sort()
+        for (s1, e1, c1), (s2, e2, c2) in zip(seq, seq[1:]):
+            if abs(c1 - c2) == 1:
+                gaps[(c1, c2)].append((s2 - e1) / FPS)
+    return {k: (np.median(v), np.percentile(v, 75) - np.percentile(v, 25)) for k, v in gaps.items()}
+
+
 def gt_owners(keys, tracks):
     """our track -> the ground-truth car it follows (IoU >= 0.5 on at least half of its frames), or None"""
     gt = lesson05.load_tracks()
@@ -190,10 +278,7 @@ def gt_owners(keys, tracks):
                 votes[hit[1]] += 1
         best = votes.most_common(1)
         owner.append(best[0][0] if best and best[0][1] >= 0.5 * len(t["frames"]) else None)
-    mapping = lesson05.reid_to_gt()
-    _, group_b_reid = lesson05.lesson02.split_cars()
-    group_b = {mapping[c] for c in group_b_reid if c in mapping}
-    return gt, owner, group_b
+    return gt, owner
 
 
 def evaluate(keys, tracks, links, gt, owner, group, quiet=False):
@@ -263,51 +348,58 @@ def main():
     ap.add_argument("--minutes", type=float, default=10)
     ap.add_argument("--model", default="vehicle/models/roundabout_uzbek_finetuned.pt")
     ap.add_argument("--threshold", type=float)
+    ap.add_argument("--time-w", type=float)
     ap.add_argument("--video-minutes", type=float, default=3)
-    ap.add_argument("--tune", action="store_true", help="pick the threshold on group-A cars")
+    ap.add_argument("--tune", action="store_true", help="pick threshold and TIME_W on group-A cars")
     args = ap.parse_args()
-    threshold = args.threshold or THRESHOLD.get(Path(args.model).name, 0.6)
+    threshold, time_w = SETTINGS.get(Path(args.model).name, (0.6, 0.0))
+    threshold = args.threshold if args.threshold is not None else threshold
+    time_w = args.time_w if args.time_w is not None else time_w
     torch.set_grad_enabled(False)
+    last_frame = int(args.minutes * 60 * FPS)
+    group_b = exam_cars()
+    masks = road_masks(group_b)
 
-    cache = OUT / f"multicam_tracks_{args.minutes:g}min_{Path(args.model).stem}.json"
-    if cache.exists():
-        saved = json.load(open(cache))
-        keys = [tuple(k) for k in saved["keys"]]
-        tracks = [{"frames": {int(f): b for f, b in t["frames"].items()}, "vec": np.array(t["vec"])} for t in saved["tracks"]]
-    else:
-        from rfdetr import RFDETRMedium
-        detector = RFDETRMedium()
-        net = load_vehicle_reid("vehicle/models/veri_sbs_R50-ibn.pth")
-        net.load_state_dict(torch.load(args.model, map_location="cpu", weights_only=True))
-        net = net.to(DEVICE).eval()
-        keys, tracks = [], []
-        for cam in (1, 2, 3, 4):
-            kept = finish(track_camera(cam, detector, net, int(args.minutes * 60 * FPS)))
-            keys += [(cam, n) for n in range(len(kept))]
-            tracks += kept
-            print(f"camera {cam}: {len(kept)} moving vehicle tracks", flush=True)
-        json.dump({"keys": keys, "tracks": [{"frames": t["frames"], "vec": t["vec"].tolist()} for t in tracks]},
-                  open(cache, "w"))
-
-    before = len(tracks)
-    stitched_keys, stitched = [], []
+    detector = None
+    net = load_vehicle_reid("vehicle/models/veri_sbs_R50-ibn.pth")
+    net.load_state_dict(torch.load(args.model, map_location="cpu", weights_only=True))
+    net = net.to(DEVICE).eval()
+    keys, tracks = [], []
     for cam in (1, 2, 3, 4):
-        joined = stitch([t for k, t in zip(keys, tracks) if k[0] == cam])
-        stitched_keys += [(cam, n) for n in range(len(joined))]
-        stitched += joined
-    keys, tracks = stitched_keys, stitched
-    print(f"stitching broken tracks: {before} -> {len(tracks)} tracks")
+        if detector is None and not (OUT / f"multicam_det_cam{cam}.json").exists():
+            from rfdetr import RFDETRMedium
+            detector = RFDETRMedium()
+        raw = track(detect_camera(cam, detector, last_frame))
+        kept = [t for t in raw if keep(t, masks[cam])]
+        described = embed(cam, kept, net)
+        joined = stitch(described)
+        keys += [(cam, n) for n in range(len(joined))]
+        tracks += joined
+        print(f"camera {cam}: {len(raw)} tracks -> {len(kept)} moving on the road -> {len(joined)} after stitching",
+              flush=True)
+
     vecs = np.stack([t["vec"] for t in tracks])
     cands = lesson05.candidates(keys, {k: t["frames"] for k, t in zip(keys, tracks)})
-    score = lambda a, b, g: float(vecs[a] @ vecs[b])      # noqa: E731
-    gt, owner, group_b = gt_owners(keys, tracks)
-    if args.tune:     # pick the threshold on group-A cars (seen in training), never on the exam cars
+    typical = travel_times(group_b)
+
+    def unusual(a, b, g):
+        """minutes the travel time lies outside the usual range for this camera pair"""
+        med, spread = typical.get((keys[a][0], keys[b][0]), (40, 30))
+        return max(0.0, abs(g - med) - spread) / 60
+
+    gt, owner = gt_owners(keys, tracks)
+    if args.tune:     # pick on group-A cars (seen in training), never on the exam cars
         group_a = {o for o in owner if o is not None} - group_b
-        grid = np.arange(0.40, 0.81, 0.02)
-        f1s = [evaluate(keys, tracks, lesson05.link(cands, score, t), gt, owner, group_a, quiet=True)[2] for t in grid]
-        threshold = float(grid[int(np.argmax(f1s))])
-        print(f"threshold picked on group A: {threshold:.2f} (F1 there {max(f1s):.1%})")
-    links = lesson05.link(cands, score, threshold)
+        best = (-1, None, None)
+        for w in (0.0, 0.1, 0.2, 0.4, 0.8):
+            score = lambda a, b, g, w=w: float(vecs[a] @ vecs[b]) - w * unusual(a, b, g)   # noqa: E731
+            for t in np.arange(0.40, 0.81, 0.02):
+                f1 = evaluate(keys, tracks, lesson05.link(cands, score, t), gt, owner, group_a, quiet=True)[2]
+                if f1 > best[0]:
+                    best = (f1, round(float(t), 2), w)
+        _, threshold, time_w = best
+        print(f"picked on group A: threshold {threshold}, TIME_W {time_w} (F1 there {best[0]:.1%})")
+    links = lesson05.link(cands, lambda a, b, g: float(vecs[a] @ vecs[b]) - time_w * unusual(a, b, g), threshold)
 
     # global numbers: follow the links
     nxt = dict(links)
@@ -320,7 +412,7 @@ def main():
                 gid[a] = n
                 a = nxt.get(a)
     print(f"\n{len(keys)} tracks in 4 cameras -> {len(links)} camera-to-camera links -> {n} different vehicles "
-          f"(threshold {threshold})")
+          f"(threshold {threshold}, TIME_W {time_w})")
 
     with open(OUT / "multicam_tracks.csv", "w", newline="") as fh:
         w = csv.writer(fh)
