@@ -7,7 +7,7 @@ One folder per model. Run every lesson from the project root, e.g.
 |---|---|---|---|
 | `plate/` | Plate reading (ANPR) | RF-DETR Nano detector + 2 fast-plate-ocr CCT readers, **trained by us** | done |
 | `face/` | Face detection and recognition | YuNet detector + AdaFace IR-101 recognizer (SFace, EdgeFace compared), **pretrained, not retrained** | working app, tested on ChokePoint video |
-| `vehicle/` | Vehicle re-identification (same car in another camera) | FastReID SBS R50-ibn (VeRi-776), **fine-tuned by us** on RoundaboutHD + Uzbek cars | multi-camera app working: same car linked across 4 cameras (F1 88%) |
+| `vehicle/` | Vehicle re-identification (same car in another camera) | FastReID SBS R50-ibn (VeRi-776), **fine-tuned by us** on RoundaboutHD + Uzbek cars | multi-camera app working: same car linked across 4 cameras (F1 87-88% formal, precision ~95% checked by eye) |
 
 ## Where the models are
 

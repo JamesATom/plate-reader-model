@@ -60,7 +60,8 @@ MIN_LEN = 5                       # tracks seen fewer times are noise
 STITCH_S, STITCH_COS = 8, 0.5     # join track pieces: at most 8 s apart and similar looking
 ROI_CELL = 64                     # road-area grid cell, pixels
 ZONE_CELL = 128                   # entry / exit zone grid cell, pixels
-SETTINGS = {"roundabout_uzbek_finetuned.pt": (0.31, 0.3)}   # (threshold, TIME_W), picked with --tune (2-fold cross-validation)
+ZONE_GROW = int(os.environ.get("ZONE_GROW", 1))   # zones = cells where group-A trips left / entered, grown by this many cells
+SETTINGS = {"roundabout_uzbek_finetuned.pt": (0.29, 0.6)}   # (threshold, TIME_W), picked with --tune (2-fold cross-validation)
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 
@@ -94,6 +95,24 @@ def detect_camera(cam, detector, last_frame):
     return out
 
 
+def dedup(boxes):
+    """class-agnostic NMS: RF-DETR (no NMS inside) gives one car several boxes, e.g. "car" + "truck" for a
+    pickup or a weak copy at low confidence. Keep the surest; drop boxes that overlap it (IoU > 0.6) or
+    lie mostly inside it (> 85% of the smaller box)."""
+    kept = []
+    for b in sorted(boxes, key=lambda b: -b[4]):
+        dup = False
+        for k in kept:
+            inter = max(0, min(b[2], k[2]) - max(b[0], k[0])) * max(0, min(b[3], k[3]) - max(b[1], k[1]))
+            sb, sk = (b[2] - b[0]) * (b[3] - b[1]), (k[2] - k[0]) * (k[3] - k[1])
+            if inter / (sb + sk - inter) > 0.6 or inter / min(sb, sk) > 0.85:
+                dup = True
+                break
+        if not dup:
+            kept.append(b)
+    return kept
+
+
 def track(dets):
     """ByteTrack-style tracking -> [{frames: {frame: box}}]"""
     active, done, max_lost = [], [], LOST_S * FPS // STEP
@@ -117,8 +136,9 @@ def track(dets):
         t["frames"][f] = box.tolist()
 
     for f in sorted(dets):
-        high = [d for d in dets[f] if d[4] >= HIGH_CONF]
-        low = [d for d in dets[f] if d[4] < HIGH_CONF]
+        boxes = dedup(dets[f])
+        high = [d for d in boxes if d[4] >= HIGH_CONF]
+        low = [d for d in boxes if d[4] < HIGH_CONF]
         pairs, rest, new = match(active, high, IOU_HIGH)            # 1. confident boxes, all tracks
         for r, c in pairs:
             update(active[r], high[c], f)
@@ -284,7 +304,8 @@ def learn_zones(group_b):
                 entries[(c1, c2)].add(foot_cell(b2[s2]))
 
     def grow(cells):
-        return {(y + dy, x + dx) for y, x in cells for dy in (-1, 0, 1) for dx in (-1, 0, 1)}
+        r = range(-ZONE_GROW, ZONE_GROW + 1)
+        return {(y + dy, x + dx) for y, x in cells for dy in r for dx in r}
     return {p: grow(c) for p, c in exits.items()}, {p: grow(c) for p, c in entries.items()}
 
 
@@ -305,6 +326,24 @@ def gt_owners(keys, tracks):
         best = votes.most_common(1)
         owner.append(best[0][0] if best and best[0][1] >= 0.5 * len(t["frames"]) else None)
     return gt, owner
+
+
+def loose_owners(keys, tracks, gt):
+    """like gt_owners but forgiving (IoU >= 0.3 on any frames): for tracks that only partly match a
+    ground-truth box (cut at the picture edge, longer than the labelled part of the road)"""
+    by_cf = defaultdict(list)
+    for (c, i), boxes in gt.items():
+        for f, b in boxes.items():
+            by_cf[(c, f)].append((i, b))
+    out = []
+    for (cam, _), t in zip(keys, tracks):
+        votes = Counter()
+        for f, b in t["frames"].items():
+            hit = max(((iou(b, g), i) for i, g in by_cf.get((cam, f), [])), default=(0, None))
+            if hit[0] >= 0.3:
+                votes[hit[1]] += 1
+        out.append(votes.most_common(1)[0][0] if votes else None)
+    return out
 
 
 def evaluate(keys, tracks, links, gt, owner, group, quiet=False):
@@ -334,6 +373,12 @@ def evaluate(keys, tracks, links, gt, owner, group, quiet=False):
               f"{sum(o is None for o in owner)}/{len(owner)}")
         print(f"  links made: {len(pred)}, right: {good} -> precision {p:.1%}   (wrong: {to_none} to a vehicle "
               f"the ground truth does not have, {len(pred) - good - to_none} to another car)")
+        loose = loose_owners(keys, tracks, gt)
+        same = sum(owner[a] != owner[b] and (owner[a] is None or owner[b] is None)
+                   and (owner[a] or loose[a]) is not None and (owner[a] or loose[a]) == (owner[b] or loose[b])
+                   for a, b in pred)
+        print(f"    of those {to_none}: {same} join the SAME car after all (its track only partly matches the "
+              f"ground-truth box) -> precision counting them right: {(good + same) / max(1, len(pred)):.1%}")
         print(f"  real camera-to-camera trips: {len(transitions)}, found: {len(transitions & made)} -> recall {r:.1%}"
               f"   F1 {f1:.1%}")
     return p, r, f1, (good, len(pred), len(transitions & made), len(transitions))
@@ -392,7 +437,15 @@ def main():
     net.load_state_dict(torch.load(args.model, map_location="cpu", weights_only=True))
     net = net.to(DEVICE).eval()
     keys, tracks = [], []
-    for cam in (1, 2, 3, 4):
+    # cache of the described tracks: tracker / embedding settings + model in the name, so linking can be re-run in seconds
+    tag = f"{args.minutes:g}min_{Path(args.model).stem}_c{LOW_CONF}-{HIGH_CONF}_iou{IOU_HIGH}-{IOU_LOW}_lost{LOST_S}_st{STITCH_S}-{STITCH_COS}_dedup"
+    track_cache = OUT / f"multicam_tracks_{tag}.json"
+    if track_cache.exists():
+        saved = json.load(open(track_cache))
+        keys = [tuple(k) for k in saved["keys"]]
+        tracks = [{"frames": {int(f): b for f, b in t["frames"].items()}, "vec": np.array(t["vec"], np.float32)}
+                  for t in saved["tracks"]]
+    for cam in (1, 2, 3, 4) if not tracks else ():
         if detector is None and not (OUT / f"multicam_det_cam{cam}.json").exists():
             from rfdetr import RFDETRMedium
             detector = RFDETRMedium()
@@ -404,9 +457,13 @@ def main():
         tracks += joined
         print(f"camera {cam}: {len(raw)} tracks -> {len(kept)} moving on the road -> {len(joined)} after stitching",
               flush=True)
+    if not track_cache.exists():
+        json.dump({"keys": keys, "tracks": [{"frames": t["frames"], "vec": t["vec"].tolist()} for t in tracks]},
+                  open(track_cache, "w"))
 
     vecs = np.stack([t["vec"] for t in tracks])
     cands = lesson05.candidates(keys, {k: t["frames"] for k, t in zip(keys, tracks)})
+    all_cands = cands
     if not args.no_zones:     # a trip a -> b must leave a through its exit zone and enter b through its entry zone
         exits, entries = learn_zones(group_b)
         ends = [foot_cell(t["frames"][max(t["frames"])]) for t in tracks]
@@ -445,6 +502,12 @@ def main():
         time_w = float(np.mean([w for _, w in picked]))
         print(f"settings for use: threshold {threshold}, TIME_W {time_w} (mean of the two picks)")
     links = lesson05.link(cands, scorer(time_w), threshold)
+    if os.environ.get("DUMP"):          # for error analysis
+        np.savez(os.environ["DUMP"], keys=np.array(keys), vecs=vecs, owner=np.array([-1 if o is None else o for o in owner]),
+                 all_cands=np.array(all_cands), cands=np.array(cands), links=np.array(links),
+                 ends=np.array([max(t["frames"]) for t in tracks]), starts=np.array([min(t["frames"]) for t in tracks]),
+                 group_b=np.array(sorted(group_b)), unusual=np.array([unusual(a, b, g) for a, b, g in cands]))
+        json.dump([{str(f): b for f, b in t["frames"].items()} for t in tracks], open(os.environ["DUMP"] + ".json", "w"))
 
     # global numbers: follow the links
     nxt = dict(links)

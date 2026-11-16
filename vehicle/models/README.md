@@ -59,7 +59,9 @@ other half), because the model has seen group-A cars: same-car similarity there 
 | App v1: IoU tracker, + RoundaboutHD + Uzbek | 70.0% | 72.0% | 71.0% |
 | App v2: ByteTrack-style tracker + road area | 78.7% | 75.6% | 77.1% |
 | App v2 + travel time | 83.2% | 81.1% | 82.1% |
-| **App v3: + entry/exit zones + cross-validated threshold** (current) | **83.7%** | **92.1%** | **87.7%** |
+| App v3: + entry/exit zones + cross-validated threshold | 83.7% | 92.1% | 87.7% |
+| **App v4: + duplicate-box removal** (current, cross-validated) | **84.8%** | **89.4%** | **87.0%** |
+| App v4, checked by eye (see below) | **95.2-97.8%** | 90.2% | ~93% |
 
 - Precision = share of the links we made that join the same car; recall = share of the real
   camera-to-camera trips we found (254 trips of 155 cars in 10 minutes).
@@ -74,6 +76,15 @@ other half), because the model has seen group-A cars: same-car similarity there 
 - App v3: entry/exit zones (where cars leave camera a / enter camera b on each trip, learned from
   group-A cars) cut the candidate pairs 11x (499k -> 45k). Recall 81% -> 92%. Of the 48 wrong links in
   the last run, 31 go to vehicles the ground truth does not label.
+- App v4: RF-DETR has no NMS inside and gave one car several boxes (on average ~26 overlapping pairs
+  per frame), so one car got 2 tracks at the same time. Class-agnostic NMS before tracking: track
+  pieces per car passage 2.02 -> 1.28 (1-piece passages 204 -> 500). F1 stays ~87-88%: the formal
+  score is now limited by the ground truth itself.
+- **The ground truth is incomplete.** All 36 links scored as wrong in the last run were checked by eye
+  (crops of both sides): 23 are clearly the same car (the ground truth has no box for that passage, or
+  gives the car another number), 7 are unclear, 6 are really wrong. Real precision is therefore
+  260-267 of 273 = 95.2-97.8%. Missed trips (25): 11 removed by the zones, 8 because one side was already
+  linked to another piece, 7 with too low similarity.
 - Camera-bias removal (subtract each camera's mean vector) helps the base VeRi model only; not used.
 - App: `uv run python vehicle/app/multicam.py` (RF-DETR Medium COCO detector, tracker, re-ID, links);
   `--tune` re-picks the threshold and travel-time weight by cross-validation.
