@@ -19,5 +19,7 @@ wheels/
 # Exception: our own trained models are shared (stored with Git LFS, see .gitattributes)
 !plate/models/
 !vehicle/models/
-# ...but not the downloaded third-party base model (vehicle/download_models.py fetches it)
+!crowd/models/
+# ...but not the downloaded third-party models (vehicle/ and crowd/download_models.py fetch them)
 vehicle/models/veri_*.pth
+crowd/models/*.pth

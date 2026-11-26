@@ -8,7 +8,7 @@ One folder per model. Run every lesson from the project root, e.g.
 | `plate/` | Plate reading (ANPR) | RF-DETR Nano detector + 2 fast-plate-ocr CCT readers, **trained by us** | done |
 | `face/` | Face detection and recognition | YuNet detector + AdaFace IR-101 recognizer (SFace, EdgeFace compared), **pretrained, not retrained** | working app, tested on ChokePoint video |
 | `vehicle/` | Vehicle re-identification (same car in another camera) | FastReID SBS R50-ibn (VeRi-776), **fine-tuned by us** on RoundaboutHD + Uzbek cars | multi-camera app working: same car linked across 4 cameras (F1 87-88% formal, precision ~95% checked by eye) |
-| `crowd/` | Crowd counting (how many people in a frame) | P2PNet (head points) and CLIP-EBC ViT-B/16 (density map), pretrained on ShanghaiTech; **P2PNet fine-tuned on Tashkent metro/concert frames** | pretrained models verified on ShanghaiTech (match the authors' scores); P2PNet chosen. Pretrained it counts gravel/lights as heads (test error 49 heads per frame); fine-tuned on 19 labelled frames: about 7 heads per frame on unseen metro and concert videos, still undercounting close-up concert faces. More labelled frames next |
+| `crowd/` | Crowd counting (how many people in a frame) | P2PNet (head points), **fine-tuned by us** on Tashkent metro/concert frames; CLIP-EBC ViT-B/16 compared | counting app working (video, camera stream or webcam): about 4-5 heads of error per frame on unseen metro and concert video (authors' model: 49); counts visible heads only, so dark far stands are missed |
 
 ## Where the models are
 
@@ -21,8 +21,10 @@ One folder per model. Run every lesson from the project root, e.g.
 - **Vehicle:** our fine-tuned models are in [`vehicle/models/`](vehicle/models/) (Git LFS); results and
   how to reproduce: [`vehicle/models/README.md`](vehicle/models/README.md). The base model they start
   from is downloaded: `uv run python vehicle/download_models.py`. Non-commercial (VeRi-776).
-- **Crowd:** made by other teams, downloaded from their official sources: `uv run python crowd/download_models.py`
-  (checks SHA-256). Code is BSD-3 / MIT, but all weights are trained on ShanghaiTech (research only).
+- **Crowd:** our fine-tuned P2PNet is in [`crowd/models/`](crowd/models/) (Git LFS); results, limits and how
+  to reproduce: [`crowd/models/README.md`](crowd/models/README.md). The authors' models it starts from
+  (and CLIP-EBC) are downloaded: `uv run python crowd/download_models.py` (checks SHA-256).
+  Research only: all weights go back to ShanghaiTech.
 
 ## Setup
 
