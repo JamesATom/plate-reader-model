@@ -40,9 +40,19 @@ def find_faces(img):
 
 def align(img, points):
     """Rotate, resize and shift the face so its 5 points land on TEMPLATE. Returns 112x112."""
+    return align_with_keypoints(img, points)[0]
+
+
+def align_with_keypoints(img, points):
+    """Like align(), and also where the 5 points really ended up in the 112x112 face, as 0..1.
+
+    They never land exactly on TEMPLATE (a turned head has its nose off-centre, a wide
+    face has its mouth corners further apart). KP-RPE (lesson 06) is told these positions.
+    """
     # "Partial" affine = only rotation + one zoom + shift, so the face is never squashed.
     matrix, _ = cv2.estimateAffinePartial2D(points.astype(np.float32), TEMPLATE, method=cv2.LMEDS)
-    return cv2.warpAffine(img, matrix, (112, 112))
+    moved = points @ matrix[:, :2].T + matrix[:, 2]
+    return cv2.warpAffine(img, matrix, (112, 112)), (moved / 112).astype(np.float32)
 
 
 def tilt_degrees(points):

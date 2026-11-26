@@ -6,7 +6,7 @@ One folder per model. Run every lesson from the project root, e.g.
 | Folder | Task | Models used | Status |
 |---|---|---|---|
 | `plate/` | Plate reading (ANPR) | RF-DETR Nano detector + 2 fast-plate-ocr CCT readers, **trained by us** | done |
-| `face/` | Face detection and recognition | YuNet detector + AdaFace IR-101 recognizer (SFace, EdgeFace compared), **pretrained, not retrained** | working app, tested on ChokePoint video |
+| `face/` | Face detection and recognition | YuNet detector + AdaFace IR-101 recognizer (SFace, EdgeFace, KP-RPE compared), **pretrained, not retrained** | working app, tested on ChokePoint video; KP-RPE (CVLFace) more accurate but slower: [report](face/reports/2026-11-24_kprpe_vs_adaface.md) |
 | `vehicle/` | Vehicle re-identification (same car in another camera) | FastReID SBS R50-ibn (VeRi-776), **fine-tuned by us** on RoundaboutHD + Uzbek cars | multi-camera app working: same car linked across 4 cameras (F1 87-88% formal, precision ~95% checked by eye) |
 | `crowd/` | Crowd counting (how many people in a frame) | P2PNet (head points), **fine-tuned by us** on Tashkent metro/concert frames; CLIP-EBC ViT-B/16 compared | counting app working (video, camera stream or webcam): about 4-5 heads of error per frame on unseen metro and concert video (authors' model: 49); counts visible heads only, so dark far stands are missed |
 
