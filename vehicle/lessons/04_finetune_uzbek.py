@@ -56,9 +56,15 @@ def uz_files():
     return files, car, video, frame
 
 
+EXAM_LIST = UZ.parent / "uz_exam_cars.txt"
+
+
 def uz_split():
+    """train 2/3, exam 1/3 of the cars. The exam was frozen into EXAM_LIST when more videos were added,
+    so new cars only ever go to training and all results stay comparable."""
     cars = sorted(set(uz_files()[1]))
-    return set(cars) - set(cars[0::3]), set(cars[0::3])        # train 2/3, exam 1/3
+    exam = set(EXAM_LIST.read_text().split()) if EXAM_LIST.exists() else set(cars[0::3])
+    return set(cars) - exam, exam
 
 
 def load_net(weights):
