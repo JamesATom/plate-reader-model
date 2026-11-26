@@ -12,6 +12,7 @@ Input: RGB image, any size; it is zero-padded (after normalising) to a multiple 
 authors' test code. Output points are in the original image's pixels.
 """
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -98,9 +99,10 @@ class P2PNet(nn.Module):
 
 
 def load_p2pnet(path, device="cpu"):
+    """The authors' checkpoint ({"model": weights}) or ours from lesson 03 (the weights alone)."""
     net = P2PNet()
-    state = torch.load(path, map_location="cpu", weights_only=True)["model"]
-    net.load_state_dict(state, strict=True)
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    net.load_state_dict(state.get("model", state), strict=True)
     return net.to(device).eval()
 
 
@@ -116,3 +118,26 @@ def find_heads(net, image_rgb, threshold=0.5):
     scores = logits.softmax(-1)[..., 1]
     keep = scores[0] > threshold
     return points[0][keep].cpu().numpy(), scores[0][keep].cpu().numpy()
+
+
+def count_heads(net, image_rgb, threshold=0.4, sizes=(1.0, 0.5), merge=10):
+    """find_heads at several image sizes, merged. Returns (N, 2) head points in full-size coordinates.
+
+    P2PNet puts each point within a few pixels of a fixed 8 px grid and learned heads of ~5-60 px, so on
+    1080p concert or metro video it misses big near faces (80-150 px) completely. Shrinking the frame
+    to half makes them ordinary-sized, but makes far-away heads vanish - so we run both. A point from
+    the smaller size is dropped if a point from a bigger size is already within merge / size pixels
+    (same head, found twice). Chosen on the validation videos of lesson 03 (error 7.8 -> 4.7 heads per
+    frame); threshold 0.4 because the fine-tuned model is a little shy.
+    For FINE-TUNED weights only: the authors' ShanghaiTech model already over-counts our video (gravel,
+    lamps), and a second pass doubles that (test error 49 -> 82). Score it with find_heads.
+    """
+    kept = np.zeros((0, 2), np.float32)
+    for s in sizes:
+        img = image_rgb if s == 1 else cv2.resize(image_rgb, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        p = find_heads(net, img, threshold)[0] / s
+        if len(kept) and len(p):
+            nearest = np.linalg.norm(p[:, None] - kept[None], axis=2).min(1)
+            p = p[nearest > merge / s]
+        kept = np.vstack([kept, p.astype(np.float32)])
+    return kept

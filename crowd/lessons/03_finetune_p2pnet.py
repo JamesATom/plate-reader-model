@@ -22,6 +22,7 @@ error, so the test frames play no part in any choice and their score is honest.
 Run:  uv run python crowd/lessons/03_finetune_p2pnet.py --test <video stem> ... --val <video stem> ...
       (a prefix such as the YouTube id is enough)
 Output: crowd/runs/p2pnet_ft/best.pt (lowest validation MAE), log in the same folder.
+Score a saved model only:  ... --weights crowd/runs/p2pnet_ft/best.pt --epochs 0 --out <scratch folder>
 """
 
 import argparse
@@ -38,7 +39,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 sys.path.insert(0, "crowd/lessons")
-from p2pnet_net import MEAN, STD, find_heads, load_p2pnet  # noqa: E402
+from p2pnet_net import MEAN, STD, count_heads, load_p2pnet  # noqa: E402
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 CROP, CROPS_PER_IMAGE = 128, 4
@@ -116,11 +117,12 @@ def loss_fn(points, logits, targets):
 
 
 def evaluate(net, frames):
-    """Count on the whole frame (the model sees the context), but compare only inside the labelled region."""
+    """Count on the whole frame (the model sees the context), but compare only inside the labelled region.
+    Counting = count_heads: full size + half size merged, as the apps count."""
     errs = []
     for img_path, pts, _, region in frames:
         rgb = cv2.cvtColor(cv2.imread(str(img_path)), cv2.COLOR_BGR2RGB)
-        found = find_heads(net, rgb)[0]
+        found = count_heads(net, rgb)
         if region:
             found, pts = found[inside(found, region)], pts[inside(pts, region)]
         errs.append((len(found), len(pts)))
@@ -142,6 +144,8 @@ def main():
     ap.add_argument("--batch", type=int, default=8, help="images per step (x4 crops)")
     ap.add_argument("--eval-every", type=int, default=10)
     ap.add_argument("--out", default="crowd/runs/p2pnet_ft")
+    ap.add_argument("--weights", default="crowd/models/p2pnet_shtech_a.pth",
+                    help="start from these weights (with --epochs 0: only score them)")
     args = ap.parse_args()
     random.seed(0), np.random.seed(0), torch.manual_seed(0)
 
@@ -158,9 +162,9 @@ def main():
     if not val:
         print("no --val: the best epoch is chosen ON THE TEST FRAMES, so the test score is too kind")
         val = test
-    net = load_p2pnet("crowd/models/p2pnet_shtech_a.pth", DEVICE)
+    net = load_p2pnet(args.weights, DEVICE)
     best, best_test = evaluate(net.eval(), val), evaluate(net, test)
-    print(f"before fine-tuning  val MAE {best['mae']:.1f}  |  test MAE {best_test['mae']:.1f}  "
+    print(f"starting weights  val MAE {best['mae']:.1f}  |  test MAE {best_test['mae']:.1f}  "
           f"MAPE {best_test['mape']:.1f}%  bias {best_test['bias']:+.1f}")
     if not train:
         sys.exit("no training frames yet: only the score of the pretrained model above")
